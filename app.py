@@ -1,49 +1,37 @@
 """
-Tool Inventory – Full Flask App (Render-ready)
-Features:
-- Auth via ADMIN_PASSWORD (env)
-- Tool CRUD (add/edit), photo upload
-- Assign/return with history (events)
-- CSV/Excel export
-- QR scanner page (html5-qrcode CDN)
-- DictLoader templates (no external files needed)
-- Persistent uploads via UPLOAD_DIR env (e.g., /var/data/uploads on Render)
+LP BYGG AS – Tool Inventory (Flask)
+Branding + CSV/Excel + QR scan + Events + Backup/Restore (Windows-safe)
+Debug on (no reloader) for local diagnostics; Render-ready; supports persistent storage via DATA_DIR/UPLOAD_DIR/DB_PATH.
 """
-
-import os
-import io
-import csv
+import os, io, csv, zipfile, tempfile, shutil, sqlite3
 from datetime import datetime
 from pathlib import Path
 from werkzeug.utils import secure_filename
 
-from flask import (
-    Flask, request, redirect, url_for, render_template, send_from_directory,
-    session, jsonify, flash, send_file
-)
+from flask import Flask, request, redirect, url_for, render_template, send_from_directory, session, jsonify, flash, send_file
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import or_
 from jinja2 import DictLoader
 from openpyxl import Workbook
 
-# --- Config ---
+# ----- Paths / storage -----
 BASE_DIR = Path(__file__).resolve().parent
-# Allow overriding uploads dir via env (for Render persistent disk)
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", BASE_DIR / "uploads"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", DATA_DIR / "uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = BASE_DIR / "inventory.db"
+DB_PATH = Path(os.environ.get("DB_PATH", DATA_DIR / "inventory.db"))
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static")
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret-change-me"),
     SQLALCHEMY_DATABASE_URI=f"sqlite:///{DB_PATH}",
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
-    MAX_CONTENT_LENGTH=10 * 1024 * 1024,  # 10 MB
+    MAX_CONTENT_LENGTH=50 * 1024 * 1024,
 )
 
 db = SQLAlchemy(app)
 
-# --- Models ---
+# ----- Models -----
 class Tool(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
@@ -51,15 +39,14 @@ class Tool(db.Model):
     category = db.Column(db.String(80), default="")
     serial_no = db.Column(db.String(120), default="")
     photo_path = db.Column(db.String(255), default="")
-    holder = db.Column(db.String(120), default="")  # who holds it
-    checkout_date = db.Column(db.String(10), default="")  # YYYY-MM-DD
-    qr_path = db.Column(db.String(255), default="")
+    holder = db.Column(db.String(120), default="")
+    checkout_date = db.Column(db.String(10), default="")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Event(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     tool_id = db.Column(db.Integer, db.ForeignKey('tool.id'), nullable=False)
-    type = db.Column(db.String(20), nullable=False)  # 'checkout', 'return', 'edit', 'create'
+    type = db.Column(db.String(20), nullable=False)  # create/edit/checkout/return
     person = db.Column(db.String(120), default="")
     when = db.Column(db.DateTime, default=datetime.utcnow)
     note = db.Column(db.Text, default="")
@@ -80,12 +67,12 @@ def require_login(func):
         return func(*args, **kwargs)
     return wrapper
 
-# --- Static uploads ---
+# ----- Static uploads -----
 @app.route('/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
-# --- Auth ---
+# ----- Auth -----
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     err = None
@@ -103,7 +90,7 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- Views ---
+# ----- Views -----
 @app.route('/')
 @require_login
 def index():
@@ -114,9 +101,7 @@ def index():
     query = Tool.query
     if q:
         like = f"%{q}%"
-        query = query.filter(
-            or_(Tool.name.ilike(like), Tool.description.ilike(like), Tool.serial_no.ilike(like))
-        )
+        query = query.filter(or_(Tool.name.ilike(like), Tool.description.ilike(like), Tool.serial_no.ilike(like)))
     if cat:
         query = query.filter_by(category=cat)
     if holder:
@@ -150,10 +135,8 @@ def tool_new():
         db.session.add(tool)
         db.session.commit()
 
-        # Log create
         db.session.add(Event(tool_id=tool.id, type='create', note='Dodano narzędzie'))
         db.session.commit()
-
         flash('Narzędzie dodane.', 'success')
         return redirect(url_for('tool_detail', tool_id=tool.id))
 
@@ -217,26 +200,20 @@ def tool_return(tool_id):
     flash('Przyjęto zwrot.', 'success')
     return redirect(url_for('tool_detail', tool_id=tool.id))
 
-# --- API ---
+# ----- API -----
 @app.route('/api/tools')
 @require_login
 def api_tools():
     tools = Tool.query.order_by(Tool.created_at.desc()).all()
-    return jsonify([
-        {
-            'id': t.id,
-            'name': t.name,
-            'description': t.description,
-            'category': t.category,
-            'serial_no': t.serial_no,
-            'photo_url': t.photo_path,
-            'holder': t.holder,
-            'checkout_date': t.checkout_date,
-            'detail_url': url_for('tool_detail', tool_id=t.id, _external=True)
-        } for t in tools
-    ])
+    return jsonify([{
+        'id': t.id, 'name': t.name, 'description': t.description,
+        'category': t.category, 'serial_no': t.serial_no,
+        'photo_url': t.photo_path, 'holder': t.holder,
+        'checkout_date': t.checkout_date,
+        'detail_url': url_for('tool_detail', tool_id=t.id, _external=True)
+    } for t in tools])
 
-# --- Export CSV/Excel ---
+# ----- Export CSV/Excel -----
 @app.route('/export/csv')
 @require_login
 def export_csv():
@@ -245,69 +222,131 @@ def export_csv():
     writer = csv.writer(output)
     writer.writerow(["id","name","category","serial_no","holder","checkout_date","created_at"])
     for t in tools:
-        writer.writerow([
-            t.id, t.name, t.category, t.serial_no, t.holder, t.checkout_date,
-            t.created_at.strftime("%Y-%m-%d %H:%M")
-        ])
+        writer.writerow([t.id, t.name, t.category, t.serial_no, t.holder, t.checkout_date, t.created_at.strftime("%Y-%m-%d %H:%M")])
     mem = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-    return send_file(mem, as_attachment=True, download_name="tools_export.csv",
-                     mimetype="text/csv; charset=utf-8")
+    return send_file(mem, as_attachment=True, download_name="tools_export.csv", mimetype="text/csv; charset=utf-8")
 
 @app.route('/export/excel')
 @require_login
 def export_excel():
     tools = Tool.query.order_by(Tool.created_at.desc()).all()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Tools"
+    wb = Workbook(); ws = wb.active; ws.title = "Tools"
     ws.append(["id","name","category","serial_no","holder","checkout_date","created_at"])
     for t in tools:
-        ws.append([
-            t.id, t.name, t.category, t.serial_no, t.holder, t.checkout_date,
-            t.created_at.strftime("%Y-%m-%d %H:%M")
-        ])
-    mem = io.BytesIO()
-    wb.save(mem)
-    mem.seek(0)
+        ws.append([t.id, t.name, t.category, t.serial_no, t.holder, t.checkout_date, t.created_at.strftime("%Y-%m-%d %H:%M")])
+    mem = io.BytesIO(); wb.save(mem); mem.seek(0)
     return send_file(mem, as_attachment=True, download_name="tools_export.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# --- Global events listing ---
-@app.route('/events')
+# ----- Backup -----
+@app.route('/backup', methods=['GET'])
 @require_login
-def events_listing():
-    events = Event.query.order_by(Event.when.desc()).all()
-    tool_names = {t.id: t.name for t in Tool.query.with_entities(Tool.id, Tool.name).all()}
-    rows = []
-    for e in events:
-        rows.append({
-            "when": e.when,
-            "type": e.type,
-            "person": e.person,
-            "tool_id": e.tool_id,
-            "tool_name": tool_names.get(e.tool_id, f"ID {e.tool_id}")
-        })
-    return render_template('events.html', rows=rows)
+def backup_now():
+    """Create ZIP: consistent SQLite dump + uploads/"""
+    db.session.commit()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_db = Path(tmpdir) / "inventory_backup.db"
+        # close connections and create consistent backup
+        db.session.remove()
+        db.engine.dispose()
+        with sqlite3.connect(DB_PATH) as src, sqlite3.connect(tmp_db) as dst:
+            src.backup(dst)
 
-# --- QR scanner page ---
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+            if tmp_db.exists():
+                z.write(tmp_db, arcname='inventory.db')
+            if UPLOAD_DIR.exists():
+                for root, _, files in os.walk(UPLOAD_DIR):
+                    for name in files:
+                        full = Path(root) / name
+                        rel = full.relative_to(UPLOAD_DIR)
+                        z.write(full, arcname=f'uploads/{rel.as_posix()}')
+    mem.seek(0)
+    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    return send_file(mem, as_attachment=True, download_name=f'backup_{ts}.zip', mimetype='application/zip')
+
+# ----- Restore (Windows-safe: copy contents, no file replace) -----
+@app.route('/backup/restore', methods=['GET', 'POST'])
+@require_login
+def restore_backup():
+    """Upload ZIP and restore inventory.db + uploads/ (overwrites current safely on Windows)."""
+    msg = None
+    if request.method == 'POST':
+        f = request.files.get('file')
+        if not f or not f.filename.lower().endswith('.zip'):
+            msg = ('danger', 'Wybierz plik ZIP z backupem.')
+        else:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+                tmpzip = tmpdir / 'in.zip'
+                f.save(tmpzip)
+                with zipfile.ZipFile(tmpzip, 'r') as z:
+                    # DB: copy pages from src to current DB using SQLite backup API
+                    if 'inventory.db' in z.namelist():
+                        db.session.remove()
+                        db.engine.dispose()
+
+                        # Extract source DB
+                        z.extract('inventory.db', tmpdir)
+                        src_db = tmpdir / 'inventory.db'
+
+                        # Backup current DB to .bak
+                        try:
+                            if DB_PATH.exists():
+                                shutil.copy2(DB_PATH, DB_PATH.with_suffix('.db.bak'))
+                        except Exception:
+                            pass
+
+                        # Copy contents (no file replace) – avoids WinError 5
+                        with sqlite3.connect(src_db) as src_conn, sqlite3.connect(DB_PATH) as dst_conn:
+                            dst_conn.execute('PRAGMA journal_mode=OFF;')
+                            dst_conn.execute('PRAGMA synchronous=OFF;')
+                            src_conn.backup(dst_conn)
+                            dst_conn.execute('PRAGMA wal_checkpoint(FULL);')
+                            dst_conn.execute('VACUUM;')
+                            dst_conn.commit()
+
+                    # Uploads (overwrite files)
+                    for member in z.namelist():
+                        if member.startswith('uploads/') and not member.endswith('/'):
+                            z.extract(member, tmpdir)
+                            src = tmpdir / member
+                            dest = UPLOAD_DIR / Path(member).relative_to('uploads')
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            if dest.exists():
+                                try:
+                                    os.remove(dest)
+                                except PermissionError:
+                                    pass
+                            shutil.move(str(src), str(dest))
+
+            msg = ('success', 'Przywrócono dane z kopii. (Bieżąca baza zarchiwizowana jako *.db.bak)')
+    return render_template('restore.html', msg=msg)
+
+# ----- QR scan page -----
 @app.route('/scan')
 @require_login
 def scan():
     return render_template('scan.html')
 
-# --- Templates ---
+# ----- Templates (brand: LP BYGG AS) -----
 TPL_BASE = r"""<!doctype html>
 <html lang="pl">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Inwentaryzacja narzędzi</title>
+    <title>LP BYGG AS – Inwentaryzacja narzędzi</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="icon" href="{{ url_for('static', filename='favicon.png') }}" sizes="64x64">
   </head>
   <body>
   <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
     <div class="container-fluid">
-      <a class="navbar-brand" href="{{ url_for('index') }}">Narzędzia</a>
+      <a class="navbar-brand d-flex align-items-center gap-2" href="{{ url_for('index') }}">
+        <img src="{{ url_for('static', filename='favicon.png') }}" alt="Logo" height="28" class="rounded">
+        <span>LP BYGG AS</span>
+      </a>
       <div class="d-flex gap-2">
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('tool_new') }}">+ Dodaj</a>
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('scan') }}">Skanuj QR</a>
@@ -315,6 +354,10 @@ TPL_BASE = r"""<!doctype html>
         <div class="btn-group">
           <a class="btn btn-sm btn-outline-info" href="{{ url_for('export_csv') }}">CSV</a>
           <a class="btn btn-sm btn-outline-info" href="{{ url_for('export_excel') }}">Excel</a>
+        </div>
+        <div class="btn-group">
+          <a class="btn btn-sm btn-outline-success" href="{{ url_for('backup_now') }}">Kopia</a>
+          <a class="btn btn-sm btn-outline-warning" href="{{ url_for('restore_backup') }}">Przywróć</a>
         </div>
         <a class="btn btn-sm btn-outline-warning" href="{{ url_for('logout') }}">Wyloguj</a>
       </div>
@@ -335,10 +378,14 @@ TPL_BASE = r"""<!doctype html>
 
 TPL_LOGIN = r"""{% extends 'base.html' %}
 {% block content %}
-  <div class="container py-5" style="max-width:480px;">
+  <div class="d-flex flex-column align-items-center mb-3">
+    <img src="{{ url_for('static', filename='logo.png') }}" alt="LP BYGG AS" style="max-height:64px;">
+    <div class="fw-semibold mt-2">LP BYGG AS</div>
+  </div>
+  <div class="container" style="max-width:480px;">
     <div class="card shadow-sm">
       <div class="card-body">
-        <h1 class="h4 mb-3">Logowanie</h1>
+        <h1 class="h5 mb-3">Logowanie do systemu narzędzi</h1>
         {% if err %}<div class="alert alert-danger">{{ err }}</div>{% endif %}
         <form method="post">
           <div class="mb-3">
@@ -580,68 +627,80 @@ TPL_SCAN = r"""{% extends 'base.html' %}
 {% block content %}
   <h1 class="h5 mb-3">Skaner QR</h1>
   <p class="text-muted">Zeskanuj kod QR z naklejki narzędzia. Po odczytaniu zostaniesz automatycznie przeniesiony do karty narzędzia.</p>
-
   <div id="reader" style="width: 100%; max-width: 420px;"></div>
   <div id="result" class="mt-3"></div>
-
   <script src="https://unpkg.com/html5-qrcode"></script>
   <script>
-    function onScanSuccess(decodedText, decodedResult) {
-      if (/^https?:\\/\\//i.test(decodedText)) {
-        window.location.href = decodedText;
-        return;
-      }
-      if (/^\\d+$/.test(decodedText)) {
-        window.location.href = "/tool/" + decodedText;
-        return;
-      }
-      document.getElementById('result').innerHTML =
-        '<div class="alert alert-warning">Nieznany format: ' + decodedText + '</div>';
+    function onScanSuccess(decodedText){
+      if(/^https?:\\/\\//i.test(decodedText)){window.location.href=decodedText;return;}
+      if(/^\\d+$/.test(decodedText)){window.location.href='/tool/'+decodedText;return;}
+      document.getElementById('result').innerHTML='<div class="alert alert-warning">Nieznany format: '+decodedText+'</div>';
     }
-    function onScanFailure(error) { /* ignore small errors */ }
-
-    const html5QrCode = new Html5Qrcode("reader");
-    Html5Qrcode.getCameras().then(devices => {
-      const cameraId = devices && devices.length ? devices[0].id : null;
-      if (!cameraId) {
-        document.getElementById('result').innerHTML =
-          '<div class="alert alert-danger">Brak kamery lub brak uprawnień do kamery.</div>';
-        return;
-      }
-      html5QrCode.start(
-        cameraId,
-        { fps: 10, qrbox: 250 },
-        onScanSuccess,
-        onScanFailure
-      );
-    }).catch(err => {
-      document.getElementById('result').innerHTML =
-        '<div class="alert alert-danger">Błąd inicjalizacji skanera: ' + (err?.message || err) + '</div>';
+    function onScanFailure(error){}
+    const html5QrCode=new Html5Qrcode('reader');
+    Html5Qrcode.getCameras().then(devices=>{
+      const cameraId=devices && devices.length?devices[0].id:null;
+      if(!cameraId){document.getElementById('result').innerHTML='<div class="alert alert-danger">Brak kamery lub uprawnień.</div>';return;}
+      html5QrCode.start(cameraId,{fps:10,qrbox:250},onScanSuccess,onScanFailure);
+    }).catch(err=>{
+      document.getElementById('result').innerHTML='<div class="alert alert-danger">Błąd inicjalizacji skanera: '+(err?.message||err)+'</div>';
     });
   </script>
 {% endblock %}"""
 
+TPL_RESTORE = r"""{% extends 'base.html' %}
+{% block content %}
+  <h1 class="h5 mb-3">Przywracanie kopii zapasowej</h1>
+  {% if msg %}
+    <div class="alert alert-{{ msg[0] }}">{{ msg[1] }}</div>
+  {% endif %}
+  <div class="alert alert-warning">
+    <strong>Uwaga:</strong> Przywrócenie może <em>nadpisać</em> obecną bazę i zdjęcia. Zrób najpierw kopię: 
+    <a href="{{ url_for('backup_now') }}">Pobierz kopię ZIP</a>.
+  </div>
+  <form method="post" enctype="multipart/form-data" class="row g-3" onsubmit="return confirm('Na pewno przywrócić dane z tej kopii? Bieżące dane mogą zostać nadpisane.')">
+    <div class="col-12 col-md-6">
+      <label class="form-label">Plik kopii (ZIP)</label>
+      <input type="file" name="file" accept=".zip" class="form-control" required>
+    </div>
+    <div class="col-12">
+      <button class="btn btn-danger">Przywróć dane</button>
+      <a class="btn btn-light" href="{{ url_for('index') }}">Anuluj</a>
+    </div>
+  </form>
+{% endblock %}"""
+
 # Register templates
-app.jinja_loader = DictLoader({
-    'base.html': TPL_BASE,
-    'login.html': TPL_LOGIN,
-    'index.html': TPL_INDEX,
-    'tool_new.html': TPL_TOOL_NEW,
-    'tool_edit.html': TPL_TOOL_EDIT,
-    'tool_detail.html': TPL_TOOL_DETAIL,
-    'events.html': TPL_EVENTS,
-    'scan.html': TPL_SCAN,
-})
+def register_templates(app):
+    app.jinja_loader = DictLoader({
+        'base.html': TPL_BASE,
+        'login.html': TPL_LOGIN,
+        'index.html': TPL_INDEX,
+        'tool_new.html': TPL_TOOL_NEW,
+        'tool_edit.html': TPL_TOOL_EDIT,
+        'tool_detail.html': TPL_TOOL_DETAIL,
+        'events.html': TPL_EVENTS,
+        'scan.html': TPL_SCAN,
+        'restore.html': TPL_RESTORE,
+    })
+register_templates(app)
 
 @app.context_processor
 def inject_now():
     return dict(now=datetime.utcnow)
 
-# Small health check
+@app.route('/events')
+@require_login
+def events_listing():
+    events = Event.query.order_by(Event.when.desc()).all()
+    tool_names = {t.id: t.name for t in Tool.query.with_entities(Tool.id, Tool.name).all()}
+    rows = [dict(when=e.when, type=e.type, person=e.person, tool_id=e.tool_id, tool_name=tool_names.get(e.tool_id, f"ID {e.tool_id}")) for e in events]
+    return render_template('events.html', rows=rows)
+
 @app.route('/healthz')
 def healthz():
     return "ok", 200
 
 if __name__ == '__main__':
-    # Local dev run
-    app.run(debug=True, host='0.0.0.0')
+    # Debug ON, but no reloader to avoid DB file locks during dev
+    app.run(debug=True, use_reloader=False, host='127.0.0.1')

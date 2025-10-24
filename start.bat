@@ -14,7 +14,7 @@ REM 3. Instalacja zależności (tylko pierwszym razem)
 pip install -r requirements.txt
 
 REM 4. Ustawienie hasła administratora (zmień poniżej)
-set ADMIN_PASSWORD=TwojeHaslo
+set ADMIN_PASSWORD=Klubtbg11!
 
 REM 5. Uruchomienie aplikacji
 python app.py
